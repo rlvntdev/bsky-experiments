@@ -10,3 +10,7 @@ python-dotenv>=0.19.0
 pylint>=2.16.1
 black>=23.3.0
 isort>=5.12.0
+redis[hiredis]>=5.0.0b3
+gevent>=21.1.2
+gevent-websocket>=0.10.1
+eventlet>=0.33.3
