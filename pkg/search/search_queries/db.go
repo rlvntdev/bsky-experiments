@@ -40,6 +40,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.addLabelStmt, err = db.PrepareContext(ctx, addLabel); err != nil {
 		return nil, fmt.Errorf("error preparing query AddLabel: %w", err)
 	}
+	if q.addLabelsToPostsStmt, err = db.PrepareContext(ctx, addLabelsToPosts); err != nil {
+		return nil, fmt.Errorf("error preparing query AddLabelsToPosts: %w", err)
+	}
 	if q.addLikeToPostStmt, err = db.PrepareContext(ctx, addLikeToPost); err != nil {
 		return nil, fmt.Errorf("error preparing query AddLikeToPost: %w", err)
 	}
@@ -55,6 +58,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getAllLabelsStmt, err = db.PrepareContext(ctx, getAllLabels); err != nil {
 		return nil, fmt.Errorf("error preparing query GetAllLabels: %w", err)
 	}
+	if q.getAllTimeBangersStmt, err = db.PrepareContext(ctx, getAllTimeBangers); err != nil {
+		return nil, fmt.Errorf("error preparing query GetAllTimeBangers: %w", err)
+	}
 	if q.getAllUniquePostLabelsStmt, err = db.PrepareContext(ctx, getAllUniquePostLabels); err != nil {
 		return nil, fmt.Errorf("error preparing query GetAllUniquePostLabels: %w", err)
 	}
@@ -69,6 +75,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.getAuthorsByHandleStmt, err = db.PrepareContext(ctx, getAuthorsByHandle); err != nil {
 		return nil, fmt.Errorf("error preparing query GetAuthorsByHandle: %w", err)
+	}
+	if q.getBangersForAuthorStmt, err = db.PrepareContext(ctx, getBangersForAuthor); err != nil {
+		return nil, fmt.Errorf("error preparing query GetBangersForAuthor: %w", err)
 	}
 	if q.getBlockedByCountForTargetStmt, err = db.PrepareContext(ctx, getBlockedByCountForTarget); err != nil {
 		return nil, fmt.Errorf("error preparing query GetBlockedByCountForTarget: %w", err)
@@ -106,11 +115,17 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getOldestPresentParentStmt, err = db.PrepareContext(ctx, getOldestPresentParent); err != nil {
 		return nil, fmt.Errorf("error preparing query GetOldestPresentParent: %w", err)
 	}
+	if q.getOptedOutAuthorsStmt, err = db.PrepareContext(ctx, getOptedOutAuthors); err != nil {
+		return nil, fmt.Errorf("error preparing query GetOptedOutAuthors: %w", err)
+	}
 	if q.getPostStmt, err = db.PrepareContext(ctx, getPost); err != nil {
 		return nil, fmt.Errorf("error preparing query GetPost: %w", err)
 	}
 	if q.getPostPageStmt, err = db.PrepareContext(ctx, getPostPage); err != nil {
 		return nil, fmt.Errorf("error preparing query GetPostPage: %w", err)
+	}
+	if q.getPostPageCursorStmt, err = db.PrepareContext(ctx, getPostPageCursor); err != nil {
+		return nil, fmt.Errorf("error preparing query GetPostPageCursor: %w", err)
 	}
 	if q.getPostWithAuthorHandleStmt, err = db.PrepareContext(ctx, getPostWithAuthorHandle); err != nil {
 		return nil, fmt.Errorf("error preparing query GetPostWithAuthorHandle: %w", err)
@@ -148,6 +163,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getTopPostersStmt, err = db.PrepareContext(ctx, getTopPosters); err != nil {
 		return nil, fmt.Errorf("error preparing query GetTopPosters: %w", err)
 	}
+	if q.getUnindexedPostPageStmt, err = db.PrepareContext(ctx, getUnindexedPostPage); err != nil {
+		return nil, fmt.Errorf("error preparing query GetUnindexedPostPage: %w", err)
+	}
 	if q.getUnprocessedImagesStmt, err = db.PrepareContext(ctx, getUnprocessedImages); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUnprocessedImages: %w", err)
 	}
@@ -157,8 +175,17 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.removeLikeFromPostStmt, err = db.PrepareContext(ctx, removeLikeFromPost); err != nil {
 		return nil, fmt.Errorf("error preparing query RemoveLikeFromPost: %w", err)
 	}
+	if q.setPostIndexedTimestampStmt, err = db.PrepareContext(ctx, setPostIndexedTimestamp); err != nil {
+		return nil, fmt.Errorf("error preparing query SetPostIndexedTimestamp: %w", err)
+	}
+	if q.setPostSentimentStmt, err = db.PrepareContext(ctx, setPostSentiment); err != nil {
+		return nil, fmt.Errorf("error preparing query SetPostSentiment: %w", err)
+	}
 	if q.unassignLabelFromAuthorStmt, err = db.PrepareContext(ctx, unassignLabelFromAuthor); err != nil {
 		return nil, fmt.Errorf("error preparing query UnassignLabelFromAuthor: %w", err)
+	}
+	if q.updateAuthorOptOutStmt, err = db.PrepareContext(ctx, updateAuthorOptOut); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateAuthorOptOut: %w", err)
 	}
 	if q.updateImageStmt, err = db.PrepareContext(ctx, updateImage); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateImage: %w", err)
@@ -198,6 +225,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing addLabelStmt: %w", cerr)
 		}
 	}
+	if q.addLabelsToPostsStmt != nil {
+		if cerr := q.addLabelsToPostsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing addLabelsToPostsStmt: %w", cerr)
+		}
+	}
 	if q.addLikeToPostStmt != nil {
 		if cerr := q.addLikeToPostStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing addLikeToPostStmt: %w", cerr)
@@ -223,6 +255,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getAllLabelsStmt: %w", cerr)
 		}
 	}
+	if q.getAllTimeBangersStmt != nil {
+		if cerr := q.getAllTimeBangersStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getAllTimeBangersStmt: %w", cerr)
+		}
+	}
 	if q.getAllUniquePostLabelsStmt != nil {
 		if cerr := q.getAllUniquePostLabelsStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getAllUniquePostLabelsStmt: %w", cerr)
@@ -246,6 +283,11 @@ func (q *Queries) Close() error {
 	if q.getAuthorsByHandleStmt != nil {
 		if cerr := q.getAuthorsByHandleStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getAuthorsByHandleStmt: %w", cerr)
+		}
+	}
+	if q.getBangersForAuthorStmt != nil {
+		if cerr := q.getBangersForAuthorStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getBangersForAuthorStmt: %w", cerr)
 		}
 	}
 	if q.getBlockedByCountForTargetStmt != nil {
@@ -308,6 +350,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getOldestPresentParentStmt: %w", cerr)
 		}
 	}
+	if q.getOptedOutAuthorsStmt != nil {
+		if cerr := q.getOptedOutAuthorsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getOptedOutAuthorsStmt: %w", cerr)
+		}
+	}
 	if q.getPostStmt != nil {
 		if cerr := q.getPostStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getPostStmt: %w", cerr)
@@ -316,6 +363,11 @@ func (q *Queries) Close() error {
 	if q.getPostPageStmt != nil {
 		if cerr := q.getPostPageStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getPostPageStmt: %w", cerr)
+		}
+	}
+	if q.getPostPageCursorStmt != nil {
+		if cerr := q.getPostPageCursorStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getPostPageCursorStmt: %w", cerr)
 		}
 	}
 	if q.getPostWithAuthorHandleStmt != nil {
@@ -378,6 +430,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getTopPostersStmt: %w", cerr)
 		}
 	}
+	if q.getUnindexedPostPageStmt != nil {
+		if cerr := q.getUnindexedPostPageStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getUnindexedPostPageStmt: %w", cerr)
+		}
+	}
 	if q.getUnprocessedImagesStmt != nil {
 		if cerr := q.getUnprocessedImagesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getUnprocessedImagesStmt: %w", cerr)
@@ -393,9 +450,24 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing removeLikeFromPostStmt: %w", cerr)
 		}
 	}
+	if q.setPostIndexedTimestampStmt != nil {
+		if cerr := q.setPostIndexedTimestampStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing setPostIndexedTimestampStmt: %w", cerr)
+		}
+	}
+	if q.setPostSentimentStmt != nil {
+		if cerr := q.setPostSentimentStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing setPostSentimentStmt: %w", cerr)
+		}
+	}
 	if q.unassignLabelFromAuthorStmt != nil {
 		if cerr := q.unassignLabelFromAuthorStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing unassignLabelFromAuthorStmt: %w", cerr)
+		}
+	}
+	if q.updateAuthorOptOutStmt != nil {
+		if cerr := q.updateAuthorOptOutStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateAuthorOptOutStmt: %w", cerr)
 		}
 	}
 	if q.updateImageStmt != nil {
@@ -448,16 +520,19 @@ type Queries struct {
 	addClusterStmt                                  *sql.Stmt
 	addImageStmt                                    *sql.Stmt
 	addLabelStmt                                    *sql.Stmt
+	addLabelsToPostsStmt                            *sql.Stmt
 	addLikeToPostStmt                               *sql.Stmt
 	addPostStmt                                     *sql.Stmt
 	addPostLabelStmt                                *sql.Stmt
 	assignLabelToAuthorStmt                         *sql.Stmt
 	getAllLabelsStmt                                *sql.Stmt
+	getAllTimeBangersStmt                           *sql.Stmt
 	getAllUniquePostLabelsStmt                      *sql.Stmt
 	getAuthorStmt                                   *sql.Stmt
 	getAuthorBlockStmt                              *sql.Stmt
 	getAuthorStatsStmt                              *sql.Stmt
 	getAuthorsByHandleStmt                          *sql.Stmt
+	getBangersForAuthorStmt                         *sql.Stmt
 	getBlockedByCountForTargetStmt                  *sql.Stmt
 	getBlocksForTargetStmt                          *sql.Stmt
 	getClustersStmt                                 *sql.Stmt
@@ -470,8 +545,10 @@ type Queries struct {
 	getMembersOfAuthorLabelStmt                     *sql.Stmt
 	getMembersOfClusterStmt                         *sql.Stmt
 	getOldestPresentParentStmt                      *sql.Stmt
+	getOptedOutAuthorsStmt                          *sql.Stmt
 	getPostStmt                                     *sql.Stmt
 	getPostPageStmt                                 *sql.Stmt
+	getPostPageCursorStmt                           *sql.Stmt
 	getPostWithAuthorHandleStmt                     *sql.Stmt
 	getPostsPageByAuthorLabelAliasStmt              *sql.Stmt
 	getPostsPageByAuthorLabelAliasFromViewStmt      *sql.Stmt
@@ -484,10 +561,14 @@ type Queries struct {
 	getPostsPageWithPostLabelSortedByHotnessStmt    *sql.Stmt
 	getThreadViewStmt                               *sql.Stmt
 	getTopPostersStmt                               *sql.Stmt
+	getUnindexedPostPageStmt                        *sql.Stmt
 	getUnprocessedImagesStmt                        *sql.Stmt
 	removeAuthorBlockStmt                           *sql.Stmt
 	removeLikeFromPostStmt                          *sql.Stmt
+	setPostIndexedTimestampStmt                     *sql.Stmt
+	setPostSentimentStmt                            *sql.Stmt
 	unassignLabelFromAuthorStmt                     *sql.Stmt
+	updateAuthorOptOutStmt                          *sql.Stmt
 	updateImageStmt                                 *sql.Stmt
 }
 
@@ -501,16 +582,19 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		addClusterStmt:                     q.addClusterStmt,
 		addImageStmt:                       q.addImageStmt,
 		addLabelStmt:                       q.addLabelStmt,
+		addLabelsToPostsStmt:               q.addLabelsToPostsStmt,
 		addLikeToPostStmt:                  q.addLikeToPostStmt,
 		addPostStmt:                        q.addPostStmt,
 		addPostLabelStmt:                   q.addPostLabelStmt,
 		assignLabelToAuthorStmt:            q.assignLabelToAuthorStmt,
 		getAllLabelsStmt:                   q.getAllLabelsStmt,
+		getAllTimeBangersStmt:              q.getAllTimeBangersStmt,
 		getAllUniquePostLabelsStmt:         q.getAllUniquePostLabelsStmt,
 		getAuthorStmt:                      q.getAuthorStmt,
 		getAuthorBlockStmt:                 q.getAuthorBlockStmt,
 		getAuthorStatsStmt:                 q.getAuthorStatsStmt,
 		getAuthorsByHandleStmt:             q.getAuthorsByHandleStmt,
+		getBangersForAuthorStmt:            q.getBangersForAuthorStmt,
 		getBlockedByCountForTargetStmt:     q.getBlockedByCountForTargetStmt,
 		getBlocksForTargetStmt:             q.getBlocksForTargetStmt,
 		getClustersStmt:                    q.getClustersStmt,
@@ -523,8 +607,10 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getMembersOfAuthorLabelStmt:        q.getMembersOfAuthorLabelStmt,
 		getMembersOfClusterStmt:            q.getMembersOfClusterStmt,
 		getOldestPresentParentStmt:         q.getOldestPresentParentStmt,
+		getOptedOutAuthorsStmt:             q.getOptedOutAuthorsStmt,
 		getPostStmt:                        q.getPostStmt,
 		getPostPageStmt:                    q.getPostPageStmt,
+		getPostPageCursorStmt:              q.getPostPageCursorStmt,
 		getPostWithAuthorHandleStmt:        q.getPostWithAuthorHandleStmt,
 		getPostsPageByAuthorLabelAliasStmt: q.getPostsPageByAuthorLabelAliasStmt,
 		getPostsPageByAuthorLabelAliasFromViewStmt:      q.getPostsPageByAuthorLabelAliasFromViewStmt,
@@ -537,10 +623,14 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		getPostsPageWithPostLabelSortedByHotnessStmt:    q.getPostsPageWithPostLabelSortedByHotnessStmt,
 		getThreadViewStmt:                               q.getThreadViewStmt,
 		getTopPostersStmt:                               q.getTopPostersStmt,
+		getUnindexedPostPageStmt:                        q.getUnindexedPostPageStmt,
 		getUnprocessedImagesStmt:                        q.getUnprocessedImagesStmt,
 		removeAuthorBlockStmt:                           q.removeAuthorBlockStmt,
 		removeLikeFromPostStmt:                          q.removeLikeFromPostStmt,
+		setPostIndexedTimestampStmt:                     q.setPostIndexedTimestampStmt,
+		setPostSentimentStmt:                            q.setPostSentimentStmt,
 		unassignLabelFromAuthorStmt:                     q.unassignLabelFromAuthorStmt,
+		updateAuthorOptOutStmt:                          q.updateAuthorOptOutStmt,
 		updateImageStmt:                                 q.updateImageStmt,
 	}
 }

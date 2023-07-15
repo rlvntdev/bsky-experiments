@@ -14,7 +14,6 @@ import (
 	"github.com/pemistahl/lingua-go"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 const (
@@ -30,7 +29,7 @@ type Sentiment struct {
 }
 
 type sentimentRequest struct {
-	Posts []search.Post `json:"posts"`
+	Posts []*search.Post `json:"posts"`
 }
 
 type sentimentDecision struct {
@@ -79,25 +78,28 @@ func NewSentiment(sentimentServiceHost string) *Sentiment {
 	}
 }
 
-func (s *Sentiment) GetPostsSentiment(ctx context.Context, posts []search.Post) ([]search.Post, error) {
+func (s *Sentiment) GetPostsSentiment(ctx context.Context, posts []*search.Post) ([]*search.Post, error) {
 	tracer := otel.Tracer("bsky-search")
 	ctx, span := tracer.Start(ctx, "Sentiment:GetPostsSentiment")
 	defer span.End()
 
-	// Return early if any of the posts are not in English
-	for _, post := range posts {
+	englishPosts := make([]*search.Post, 0, len(posts))
+
+	// Return early if all of the posts are not in English
+	for i, post := range posts {
 		confidence := s.LanguageDetector.ComputeLanguageConfidence(post.Text, lingua.English)
-		if confidence < 0.5 {
-			span.SetAttributes(attribute.String("language", "non-english"))
-			span.SetAttributes(attribute.Float64("language.confidence", confidence))
-			span.SetAttributes(attribute.Bool("skipping_sentiment", true))
-			return posts, nil
+		if confidence > 0.5 {
+			englishPosts = append(englishPosts, posts[i])
 		}
+	}
+
+	if len(englishPosts) == 0 {
+		return posts, nil
 	}
 
 	url := fmt.Sprintf("%s/analyze_sentiment", s.SentimentServiceHost)
 
-	reqBody := sentimentRequest{Posts: posts}
+	reqBody := sentimentRequest{Posts: englishPosts}
 	jsonReqBody, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal sentiment request body: %w", err)
@@ -120,20 +122,31 @@ func (s *Sentiment) GetPostsSentiment(ctx context.Context, posts []search.Post) 
 		return nil, fmt.Errorf("failed to decode sentiment response body: %w", err)
 	}
 
-	for i, post := range respBody.Posts {
-		if post.Decision.Sentiment == POSITIVE {
+	for i, p := range respBody.Posts {
+		if p.Decision.Sentiment == POSITIVE {
 			sentiment := strings.Clone(search.PositiveSentiment)
-			posts[i].Sentiment = &sentiment
-		} else if post.Decision.Sentiment == NEGATIVE {
+			englishPosts[i].Sentiment = &sentiment
+		} else if p.Decision.Sentiment == NEGATIVE {
 			sentiment := strings.Clone(search.NegativeSentiment)
-			posts[i].Sentiment = &sentiment
-		} else if post.Decision.Sentiment == NEUTRAL {
+			englishPosts[i].Sentiment = &sentiment
+		} else if p.Decision.Sentiment == NEUTRAL {
 			sentiment := strings.Clone(search.NeutralSentiment)
-			posts[i].Sentiment = &sentiment
+			englishPosts[i].Sentiment = &sentiment
 		} else {
-			log.Printf("unknown sentiment: %s\n", post.Decision.Sentiment)
+			log.Printf("unknown sentiment: %s\n", p.Decision.Sentiment)
 		}
-		posts[i].SentimentConfidence = &post.Decision.Confidence
+		var confidence float64
+		confidence = p.Decision.Confidence
+		englishPosts[i].SentimentConfidence = &confidence
+	}
+
+	// Merge the english posts back into the original posts slice
+	for i, post := range posts {
+		for _, englishPost := range englishPosts {
+			if post.ID == englishPost.ID {
+				posts[i] = englishPost
+			}
+		}
 	}
 
 	return posts, nil

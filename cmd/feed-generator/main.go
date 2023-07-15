@@ -14,20 +14,17 @@ import (
 	feedgenerator "github.com/ericvolp12/bsky-experiments/pkg/feed-generator"
 	"github.com/ericvolp12/bsky-experiments/pkg/feed-generator/endpoints"
 	"github.com/ericvolp12/bsky-experiments/pkg/feeds/authorlabel"
+	"github.com/ericvolp12/bsky-experiments/pkg/feeds/bangers"
 	"github.com/ericvolp12/bsky-experiments/pkg/feeds/cluster"
+	"github.com/ericvolp12/bsky-experiments/pkg/feeds/firehose"
 	"github.com/ericvolp12/bsky-experiments/pkg/feeds/postlabel"
 	"github.com/ericvolp12/bsky-experiments/pkg/search"
+	"github.com/ericvolp12/bsky-experiments/pkg/tracing"
 	ginprometheus "github.com/ericvolp12/go-gin-prometheus"
 	"github.com/gin-contrib/cors"
 	ginzap "github.com/gin-contrib/zap"
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.uber.org/zap"
 )
 
@@ -72,7 +69,8 @@ func main() {
 	// Registers a tracer Provider globally if the exporter endpoint is set
 	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
 		log.Println("initializing tracer...")
-		shutdown, err := installExportPipeline(ctx)
+		// Start tracer with 20% sampling rate
+		shutdown, err := tracing.InstallExportPipeline(ctx, "BSky-Feed-Generator-Go", 0.2)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -143,6 +141,20 @@ func main() {
 		log.Fatalf("Failed to create AuthorLabelFeed: %v", err)
 	}
 	feedGenerator.AddFeed(authorLabelFeedAliases, authorLabelFeed)
+
+	// Create a firehose feed
+	firehoseFeed, firehoseFeedAliases, err := firehose.NewFirehoseFeed(ctx, feedActorDID, postRegistry)
+	if err != nil {
+		log.Fatalf("Failed to create FirehoseFeed: %v", err)
+	}
+	feedGenerator.AddFeed(firehoseFeedAliases, firehoseFeed)
+
+	// Create a Bangers feed
+	bangersFeed, bangersFeedAliases, err := bangers.NewBangersFeed(ctx, feedActorDID, postRegistry)
+	if err != nil {
+		log.Fatalf("Failed to create BangersFeed: %v", err)
+	}
+	feedGenerator.AddFeed(bangersFeedAliases, bangersFeed)
 
 	router := gin.New()
 
@@ -279,41 +291,4 @@ func main() {
 
 	log.Printf("Starting server on port %s", port)
 	router.Run(fmt.Sprintf(":%s", port))
-}
-
-func installExportPipeline(ctx context.Context) (func(context.Context) error, error) {
-	client := otlptracehttp.NewClient()
-	exporter, err := otlptrace.New(ctx, client)
-	if err != nil {
-		return nil, fmt.Errorf("creating OTLP trace exporter: %w", err)
-	}
-
-	tracerProvider := newTraceProvider(exporter)
-	otel.SetTracerProvider(tracerProvider)
-
-	return tracerProvider.Shutdown, nil
-}
-
-func newTraceProvider(exp sdktrace.SpanExporter) *sdktrace.TracerProvider {
-	// Ensure default SDK resources and the required service name are set.
-	r, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName("BSky-Feed-Generator-Go"),
-		),
-	)
-
-	if err != nil {
-		panic(err)
-	}
-
-	// initialize the traceIDRatioBasedSampler
-	traceIDRatioBasedSampler := sdktrace.TraceIDRatioBased(1)
-
-	return sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(traceIDRatioBasedSampler),
-		sdktrace.WithBatcher(exp),
-		sdktrace.WithResource(r),
-	)
 }

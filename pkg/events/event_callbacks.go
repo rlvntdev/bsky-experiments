@@ -3,10 +3,8 @@ package events
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"path"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,9 +17,7 @@ import (
 	"github.com/bluesky-social/indigo/repomgr"
 	"github.com/ericvolp12/bsky-experiments/pkg/persistedgraph"
 	"github.com/ericvolp12/bsky-experiments/pkg/search"
-	"github.com/ericvolp12/bsky-experiments/pkg/sentiment"
 	intXRPC "github.com/ericvolp12/bsky-experiments/pkg/xrpc"
-	"github.com/meilisearch/meilisearch-go"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -43,6 +39,7 @@ type RepoStreamCtxCallbacks struct {
 // RepoRecord holds data needed for processing a RepoRecord
 type RepoRecord struct {
 	ctx       context.Context
+	seq       int64
 	pst       appbsky.FeedPost
 	opPath    string
 	repoName  string
@@ -59,7 +56,9 @@ type BSky struct {
 
 	Logger *zap.SugaredLogger
 
-	LastSeq int64 // LastSeq is the last sequence number processed
+	SeqMux      sync.RWMutex
+	LastUpdated time.Time
+	LastSeq     int64 // LastSeq is the last sequence number processed
 
 	redisClient     *redis.Client
 	cachesPrefix    string
@@ -69,27 +68,22 @@ type BSky struct {
 	RepoRecordQueue chan RepoRecord
 
 	// Rate Limiter for requests against the BSky API
-	bskyLimiter *rate.Limiter
+	bskyLimiter      *rate.Limiter
+	directoryLimiter *rate.Limiter
 
 	WorkerCount int
 	Workers     []*Worker
 
 	PostRegistryEnabled bool
 	PostRegistry        *search.PostRegistry
-
-	SentimentAnalysisEnabled bool
-	SentimentAnalysis        *sentiment.Sentiment
-
-	MeiliClient *meilisearch.Client
 }
 
 // NewBSky creates a new BSky struct with an authenticated XRPC client
 // and a social graph, initializing mutexes for cross-routine access
 func NewBSky(
 	ctx context.Context,
-	log *zap.SugaredLogger,
-	includeLinks, postRegistryEnabled, sentimentAnalysisEnabled bool,
-	dbConnectionString, sentimentServiceHost, meilisearchHost string,
+	includeLinks, postRegistryEnabled bool,
+	dbConnectionString string,
 	persistedGraph *persistedgraph.PersistedGraph,
 	redisClient *redis.Client,
 	workerCount int,
@@ -105,23 +99,12 @@ func NewBSky(
 		}
 	}
 
-	var sentimentAnalysis *sentiment.Sentiment
-
-	if sentimentAnalysisEnabled {
-		sentimentAnalysis = sentiment.NewSentiment(sentimentServiceHost)
-	}
-
-	meiliClient := meilisearch.NewClient(meilisearch.ClientConfig{
-		Host: meilisearchHost,
-	})
-
-	// Check connection to MeiliSearch
-	_, err = meiliClient.Health()
+	rawlog, err := zap.NewProduction()
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to MeiliSearch: %w", err)
+		fmt.Printf("failed to create logger: %+v\n", err)
+		return nil, err
 	}
-
-	log = log.With("source", "event_handler")
+	log := rawlog.Sugar().With("source", "event_handler")
 
 	bsky := &BSky{
 		IncludeLinks: includeLinks,
@@ -130,25 +113,24 @@ func NewBSky(
 
 		Logger: log,
 
+		SeqMux:      sync.RWMutex{},
+		LastUpdated: time.Now(),
+
 		// 60 minute Cache TTLs
 		cachesPrefix:    "graph_builder",
 		redisClient:     redisClient,
-		profileCacheTTL: time.Hour * 6,
+		profileCacheTTL: time.Hour * 12,
 		postCacheTTL:    time.Minute * 60,
 
-		RepoRecordQueue: make(chan RepoRecord, 100),
-		bskyLimiter:     rate.NewLimiter(rate.Every(time.Millisecond*125), 1),
+		RepoRecordQueue:  make(chan RepoRecord, 1),
+		bskyLimiter:      rate.NewLimiter(rate.Every(time.Millisecond*125), 1),
+		directoryLimiter: rate.NewLimiter(rate.Every(time.Millisecond*125), 1),
 
 		WorkerCount: workerCount,
 		Workers:     make([]*Worker, workerCount),
 
 		PostRegistryEnabled: postRegistryEnabled,
 		PostRegistry:        postRegistry,
-
-		SentimentAnalysisEnabled: sentimentAnalysisEnabled,
-		SentimentAnalysis:        sentimentAnalysis,
-
-		MeiliClient: meiliClient,
 	}
 
 	// Initialize the workers, each with their own BSky Client and Mutex
@@ -159,27 +141,13 @@ func NewBSky(
 			return nil, err
 		}
 
-		rawlog, err := zap.NewProduction()
-		if err != nil {
-			log.Fatalf("failed to create logger: %+v\n", err)
-		}
-		defer func() {
-			err := rawlog.Sync()
-			if err != nil {
-				fmt.Printf("failed to sync logger on teardown: %+v", err.Error())
-			}
-		}()
-
-		log := rawlog.Sugar().With("worker_id", i)
-
 		bsky.Workers[i] = &Worker{
 			WorkerID:  i,
 			Client:    client,
 			ClientMux: sync.RWMutex{},
-			Logger:    log,
 		}
 
-		go bsky.worker(i)
+		go bsky.worker(ctx, i)
 	}
 
 	return bsky, nil
@@ -191,9 +159,17 @@ func (bsky *BSky) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSubs
 	ctx, span := tracer.Start(ctx, "HandleRepoCommit")
 	defer span.End()
 
-	log := bsky.Logger.With("repo", evt.Repo, "seq", evt.Seq)
-
+	span.AddEvent("AcquireSeqLock")
+	bsky.SeqMux.Lock()
+	span.AddEvent("SeqLockAcquired")
+	bsky.LastUpdated = time.Now()
 	bsky.LastSeq = evt.Seq
+	bsky.SeqMux.Unlock()
+	span.AddEvent("ReleaseSeqLock")
+
+	lastSeq.Set(float64(evt.Seq))
+
+	log := bsky.Logger.With("repo", evt.Repo, "seq", evt.Seq)
 
 	rr, err := repo.ReadRepoFromCar(ctx, bytes.NewReader(evt.Blocks))
 	if err != nil {
@@ -209,34 +185,9 @@ func (bsky *BSky) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSubs
 		switch ek {
 		case repomgr.EvtKindCreateRecord, repomgr.EvtKindUpdateRecord:
 			span.SetAttributes(attribute.String("op.path", op.Path))
-			// Grab the record from the merkel tree
-			rc, rec, err := rr.GetRecord(ctx, op.Path)
-			if err != nil {
-				e := fmt.Errorf("getting record %s (%s) within seq %d for %s: %w", op.Path, *op.Cid, evt.Seq, evt.Repo, err)
-				log.Errorf("failed to get a record from the event: %+v\n", e)
-				return nil
-			}
-
-			err = bsky.PersistedGraph.SetCursor(ctx, fmt.Sprintf("%d", evt.Seq))
-			if err != nil {
-				log.Errorf("failed to set cursor: %+v\n", err)
-			}
-
-			// Verify that the record cid matches the cid in the event
-			if lexutil.LexLink(rc) != *op.Cid {
-				e := fmt.Errorf("mismatch in record and op cid: %s != %s", rc, *op.Cid)
-				log.Errorf("failed to LexLink the record in the event: %+v\n", e)
-				return nil
-			}
-
-			recordAsCAR := lexutil.LexiconTypeDecoder{
-				Val: rec,
-			}
-
-			// Attempt to Unpack the CAR Blocks into JSON Byte Array
-			b, err := recordAsCAR.MarshalJSON()
-			if err != nil {
-				log.Errorf("failed to marshal record as CAR: %+v\n", err)
+			// Check if this record is modifying the user's profile
+			if op.Path == "app.bsky.actor.profile/self" {
+				log.Infof("found profile update for %s", evt.Repo)
 				return nil
 			}
 
@@ -247,47 +198,54 @@ func (bsky *BSky) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSubs
 				return nil
 			}
 
-			// If the record is a block, try to unmarshal it into a GraphBlock and log it
-			if strings.HasPrefix(op.Path, "app.bsky.graph.block") {
-				span.SetAttributes(attribute.String("repo.name", evt.Repo))
-				span.SetAttributes(attribute.String("event.type", "app.bsky.graph.block"))
-				// Unmarshal the JSON Byte Array into a Block
-				var block = appbsky.GraphBlock{}
-				err = json.Unmarshal(b, &block)
-				if err != nil {
-					log.Errorf("failed to unmarshal block into a GraphBlock: %+v\n", err)
-					return nil
-				}
-				span.SetAttributes(attribute.String("block.subject", block.Subject))
-				err = bsky.PostRegistry.AddAuthorBlock(ctx, evt.Repo, block.Subject, t)
-				if err != nil {
-					log.Errorf("failed to add author block to registry: %+v\n", err)
-					return nil
-				}
-				log.Infow("processed graph block", "target", block.Subject, "source", evt.Repo)
+			lastSeqCreatedAt.Set(float64(t.UnixNano()))
+			lastSeqProcessedAt.Set(float64(time.Now().UnixNano()))
+
+			err = bsky.PersistedGraph.SetCursor(ctx, fmt.Sprintf("%d", evt.Seq))
+			if err != nil {
+				log.Errorf("failed to set cursor: %+v\n", err)
+			}
+
+			// Grab the record from the merkel tree
+			rc, rec, err := rr.GetRecord(ctx, op.Path)
+			if err != nil {
+				e := fmt.Errorf("getting record %s (%s) within seq %d for %s: %w", op.Path, *op.Cid, evt.Seq, evt.Repo, err)
+				log.Errorf("failed to get a record from the event: %+v\n", e)
 				return nil
 			}
 
-			// If the record is a like, try to unmarshal it into a Like and stick it in the DB
-			if strings.HasPrefix(op.Path, "app.bsky.feed.like") {
+			// Verify that the record cid matches the cid in the event
+			if lexutil.LexLink(rc) != *op.Cid {
+				e := fmt.Errorf("mismatch in record and op cid: %s != %s", rc, *op.Cid)
+				log.Errorf("failed to LexLink the record in the event: %+v\n", e)
+				return nil
+			}
+
+			// Unpack the record and process it
+			switch rec := rec.(type) {
+			case *appbsky.FeedPost:
+				span.AddEvent("Adding to Queue")
+				// Add the RepoRecord to the Queue
+				bsky.RepoRecordQueue <- RepoRecord{
+					ctx:       ctx,
+					seq:       evt.Seq,
+					pst:       *rec,
+					repoName:  evt.Repo,
+					opPath:    op.Path,
+					eventTime: evt.Time,
+				}
+				span.AddEvent("Added to Queue")
+			case *appbsky.FeedLike:
 				span.SetAttributes(attribute.String("repo.name", evt.Repo))
 				span.SetAttributes(attribute.String("event.type", "app.bsky.feed.like"))
-				// Unmarshal the JSON Byte Array into a Like
-				var like = appbsky.FeedLike{}
-				err = json.Unmarshal(b, &like)
-				if err != nil {
-					log.Errorf("failed to unmarshal like into a Like: %+v\n", err)
-					return nil
-				}
+				if rec.Subject != nil {
+					span.SetAttributes(attribute.String("like.subject.uri", rec.Subject.Uri))
 
-				if like.Subject != nil {
-					span.SetAttributes(attribute.String("like.subject.uri", like.Subject.Uri))
-
-					_, postID := path.Split(like.Subject.Uri)
+					_, postID := path.Split(rec.Subject.Uri)
 					span.SetAttributes(attribute.String("like.subject.post_id", postID))
 
 					// Add the Like to the DB
-					err := bsky.PostRegistry.AddLikeToPost(ctx, postID)
+					err := bsky.PostRegistry.AddLikeToPost(ctx, postID, evt.Repo)
 					if err != nil {
 						log.Errorf("failed to add like to post: %+v\n", err)
 						span.SetAttributes(attribute.String("error", err.Error()))
@@ -295,29 +253,38 @@ func (bsky *BSky) HandleRepoCommit(ctx context.Context, evt *comatproto.SyncSubs
 					likesProcessedCounter.Inc()
 				}
 				return nil
-			}
-
-			// Unmarshal the JSON Byte Array into a FeedPost
-			var pst = appbsky.FeedPost{}
-			err = json.Unmarshal(b, &pst)
-			if err != nil {
-				log.Errorf("failed to unmarshal post into a FeedPost: %+v\n", err)
+			case *appbsky.FeedRepost:
+				// Ignore reposts for now
+			case *appbsky.GraphBlock:
+				span.SetAttributes(attribute.String("repo.name", evt.Repo))
+				span.SetAttributes(attribute.String("event.type", "app.bsky.graph.block"))
+				span.SetAttributes(attribute.String("block.subject", rec.Subject))
+				err = bsky.PostRegistry.AddAuthorBlock(ctx, evt.Repo, rec.Subject, t)
+				if err != nil {
+					log.Errorf("failed to add author block to registry: %+v\n", err)
+					return nil
+				}
+				log.Infow("processed graph block", "target", rec.Subject, "source", evt.Repo)
 				return nil
+
+			case *appbsky.GraphFollow:
+				// Ignore follows for now
+			case *appbsky.ActorProfile:
+				// Ignore profile updates for now
+			case *appbsky.FeedGenerator:
+				// Ignore feed generator updates for now
+			case *appbsky.GraphList:
+				// Ignore mute list creation for now
+			case *appbsky.GraphListitem:
+				// Ignore mute list updates for now
+			default:
+				log.Warnf("unknown record type: %+v", rec)
 			}
 
-			// Add the RepoRecord to the Queue
-			bsky.RepoRecordQueue <- RepoRecord{
-				ctx:       ctx,
-				pst:       pst,
-				repoName:  evt.Repo,
-				opPath:    op.Path,
-				eventTime: evt.Time,
-			}
 		case repomgr.EvtKindDeleteRecord:
 			deleteRecordsProcessed.Inc()
 			span.SetAttributes(attribute.String("evt.kind", "delete"))
 			span.SetAttributes(attribute.String("op.path", op.Path))
-			return nil
 		}
 	}
 	return nil

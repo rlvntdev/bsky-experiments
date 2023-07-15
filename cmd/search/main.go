@@ -10,6 +10,7 @@ import (
 
 	"github.com/ericvolp12/bsky-experiments/pkg/search"
 	"github.com/ericvolp12/bsky-experiments/pkg/search/endpoints"
+	"github.com/ericvolp12/bsky-experiments/pkg/tracing"
 	"github.com/ericvolp12/bsky-experiments/pkg/usercount"
 	intXRPC "github.com/ericvolp12/bsky-experiments/pkg/xrpc"
 	ginprometheus "github.com/ericvolp12/go-gin-prometheus"
@@ -18,18 +19,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.uber.org/zap"
 )
-
-type preheatItem struct {
-	authorID string
-	postID   string
-}
 
 func main() {
 	ctx := context.Background()
@@ -72,7 +63,7 @@ func main() {
 	// Registers a tracer Provider globally if the exporter endpoint is set
 	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
 		log.Println("initializing tracer...")
-		shutdown, err := installExportPipeline(ctx)
+		shutdown, err := tracing.InstallExportPipeline(ctx, "BSkySearchAPI", 1)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -81,11 +72,6 @@ func main() {
 				log.Fatal(err)
 			}
 		}()
-	}
-
-	binaryGraphPath := os.Getenv("BINARY_GRAPH_PATH")
-	if binaryGraphPath == "" {
-		log.Fatal("BINARY_GRAPH_PATH environment variable is required")
 	}
 
 	postRegistry, err := search.NewPostRegistry(dbConnectionString)
@@ -104,12 +90,11 @@ func main() {
 	api, err := endpoints.NewAPI(
 		postRegistry,
 		userCount,
-		binaryGraphPath,
 		graphJSONUrl,
 		layoutServiceHost,
-		30*time.Minute, // Thread View Cache TTL
-		30*time.Minute, // Layout Cache TTL
-		5*time.Minute,  // Stats Cache TTL
+		1*time.Minute, // Thread View Cache TTL
+		1*time.Minute, // Layout Cache TTL
+		5*time.Minute, // Stats Cache TTL
 	)
 
 	router := gin.New()
@@ -178,9 +163,12 @@ func main() {
 	p.Use(router)
 
 	router.GET("/thread", api.ProcessThreadRequest)
-	router.GET("/distance", api.GetSocialDistance)
 	router.GET("/stats", api.GetAuthorStats)
 	router.GET("/post/:id", api.GetPost)
+
+	router.GET("/opted_out_authors", api.GetOptedOutAuthors)
+	router.POST("/opt_out", api.GraphOptOut)
+	router.POST("/opt_in", api.GraphOptIn)
 
 	router.GET("/clusters", api.GetClusterList)
 	router.GET("/users/by_handle/:handle/cluster", api.GetClusterForHandle)
@@ -190,39 +178,6 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-
-	// Preheat the caches with some popular threads
-	preheatList := []preheatItem{
-		{authorID: "did:plc:wgaezxqi2spqm3mhrb5xvkzi", postID: "3juzlwllznd24"},
-	}
-
-	// Create a routine to preheat the caches every 30 minutes
-	cachePreheatTicker := time.NewTicker(30*time.Minute + 45*time.Second)
-	go func() {
-		ctx := context.Background()
-		tracer := otel.Tracer("search-api")
-		for {
-			ctx, span := tracer.Start(ctx, "preheatCaches")
-			log.Printf("Preheating caches with %d threads", len(preheatList))
-			for _, threadToHeat := range preheatList {
-				threadView, err := api.GetThreadView(ctx, threadToHeat.postID, threadToHeat.authorID)
-				if err != nil {
-					log.Printf("Error preheating thread view cache: %v", err)
-				}
-				_, err = api.LayoutThread(ctx, threadToHeat.postID, threadView)
-				if err != nil {
-					log.Printf("Error preheating layout cache: %v", err)
-				}
-			}
-			span.End()
-			select {
-			case <-cachePreheatTicker.C:
-				continue
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
 
 	statsRefreshTicker := time.NewTicker(5 * time.Minute)
 
@@ -249,41 +204,4 @@ func main() {
 
 	log.Printf("Starting server on port %s", port)
 	router.Run(fmt.Sprintf(":%s", port))
-}
-
-func installExportPipeline(ctx context.Context) (func(context.Context) error, error) {
-	client := otlptracehttp.NewClient()
-	exporter, err := otlptrace.New(ctx, client)
-	if err != nil {
-		return nil, fmt.Errorf("creating OTLP trace exporter: %w", err)
-	}
-
-	tracerProvider := newTraceProvider(exporter)
-	otel.SetTracerProvider(tracerProvider)
-
-	return tracerProvider.Shutdown, nil
-}
-
-func newTraceProvider(exp sdktrace.SpanExporter) *sdktrace.TracerProvider {
-	// Ensure default SDK resources and the required service name are set.
-	r, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName("BSkySearchAPI"),
-		),
-	)
-
-	if err != nil {
-		panic(err)
-	}
-
-	// initialize the traceIDRatioBasedSampler
-	traceIDRatioBasedSampler := sdktrace.TraceIDRatioBased(1)
-
-	return sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(traceIDRatioBasedSampler),
-		sdktrace.WithBatcher(exp),
-		sdktrace.WithResource(r),
-	)
 }

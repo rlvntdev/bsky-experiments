@@ -10,8 +10,9 @@ import (
 )
 
 type Author struct {
-	Did    string `json:"did"`
-	Handle string `json:"handle"`
+	Did           string `json:"did"`
+	Handle        string `json:"handle"`
+	ClusterOptOut bool   `json:"cluster_opt_out"`
 }
 
 type AuthorBlock struct {
@@ -68,6 +69,7 @@ type Post struct {
 	ParentRelationship  sql.NullString  `json:"parent_relationship"`
 	Sentiment           sql.NullString  `json:"sentiment"`
 	SentimentConfidence sql.NullFloat64 `json:"sentiment_confidence"`
+	IndexedAt           sql.NullTime    `json:"indexed_at"`
 }
 
 type PostHotness struct {
@@ -88,11 +90,13 @@ type PostHotness struct {
 }
 
 type PostLabel struct {
-	PostID string `json:"post_id"`
-	Label  string `json:"label"`
+	PostID    string `json:"post_id"`
+	AuthorDid string `json:"author_did"`
+	Label     string `json:"label"`
 }
 
 type PostLike struct {
-	PostID    string `json:"post_id"`
-	LikeCount int64  `json:"like_count"`
+	PostID    string         `json:"post_id"`
+	AuthorDid sql.NullString `json:"author_did"`
+	LikeCount int64          `json:"like_count"`
 }

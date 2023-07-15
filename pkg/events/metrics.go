@@ -70,3 +70,24 @@ var likesProcessedCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "bsky_likes_processed_total",
 	Help: "The total number of likes processed",
 })
+
+var indexingLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "bsky_indexing_latency_seconds",
+	Help:    "The duration of adding a post to the index",
+	Buckets: prometheus.ExponentialBuckets(0.001, 30, 15),
+})
+
+var lastSeq = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "bsky_last_seq",
+	Help: "The last sequence number processed",
+})
+
+var lastSeqProcessedAt = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "bsky_last_seq_processed_at",
+	Help: "The timestamp of the last sequence number processed",
+})
+
+var lastSeqCreatedAt = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "bsky_last_seq_created_at",
+	Help: "The timestamp of the last sequence number created",
+})

@@ -3,7 +3,9 @@ package search
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"time"
 
 	_ "github.com/lib/pq" // postgres driver
 
@@ -18,15 +20,45 @@ type Label struct {
 	Name        string `json:"name"`
 }
 
-func (pr *PostRegistry) AddPostLabel(ctx context.Context, postID string, label string) error {
+func (pr *PostRegistry) AddPostLabel(ctx context.Context, postID string, authorDid string, label string) error {
 	tracer := otel.Tracer("post-registry")
 	ctx, span := tracer.Start(ctx, "PostRegistry:AddPostLabel")
 	defer span.End()
 
 	err := pr.queries.AddPostLabel(ctx, search_queries.AddPostLabelParams{
-		PostID: postID,
-		Label:  label,
+		PostID:    postID,
+		AuthorDid: authorDid,
+		Label:     label,
 	})
+	return err
+}
+
+func (pr *PostRegistry) AddOneLabelPerPost(ctx context.Context, labels []string, postIDs []string, authorDIDs []string) error {
+	tracer := otel.Tracer("PostRegistry")
+	ctx, span := tracer.Start(ctx, "AddOneLabelPerPost")
+	defer span.End()
+
+	if len(labels) != len(postIDs) || len(labels) != len(authorDIDs) {
+		return fmt.Errorf("labels, postIDs, and authorDIDs must be the same length")
+	}
+
+	labelMap := make([]map[string]interface{}, len(labels))
+
+	for i, postID := range postIDs {
+		labelMap[i] = map[string]interface{}{
+			"post_id":    postID,
+			"author_did": authorDIDs[i],
+			"label":      labels[i],
+		}
+	}
+
+	b, err := json.Marshal(labelMap)
+	if err != nil {
+		return fmt.Errorf("error marshalling labels: %w", err)
+	}
+
+	err = pr.queries.AddLabelsToPosts(ctx, b)
+
 	return err
 }
 
@@ -420,16 +452,16 @@ func (pr *PostRegistry) GetPostsPageForPostLabelChronological(
 	ctx context.Context,
 	postLabel string,
 	limit int32,
-	cursor string,
+	cursor time.Time,
 ) ([]*Post, error) {
 	tracer := otel.Tracer("post-registry")
 	ctx, span := tracer.Start(ctx, "PostRegistry:GetPostsPageForPostLabelChronological")
 	defer span.End()
 
 	posts, err := pr.queries.GetPostsPageWithPostLabelChronological(ctx, search_queries.GetPostsPageWithPostLabelChronologicalParams{
-		Label:  postLabel,
-		Limit:  limit,
-		Cursor: cursor,
+		Label:     postLabel,
+		Limit:     limit,
+		CreatedAt: cursor,
 	})
 
 	if err != nil {
@@ -466,8 +498,6 @@ func (pr *PostRegistry) GetPostsPageForPostLabelChronological(
 			sentimentConfidence = &p.SentimentConfidence.Float64
 		}
 
-		hotness := p.Hotness
-
 		retPosts[i] = &Post{
 			ID:                  p.ID,
 			Text:                p.Text,
@@ -479,7 +509,6 @@ func (pr *PostRegistry) GetPostsPageForPostLabelChronological(
 			ParentRelationship:  parentRelationshipPtr,
 			Sentiment:           sentiment,
 			SentimentConfidence: sentimentConfidence,
-			Hotness:             &hotness,
 		}
 
 	}

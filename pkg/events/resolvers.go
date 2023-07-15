@@ -140,7 +140,7 @@ func (bsky *BSky) getHandleFromDirectory(ctx context.Context, did string) (handl
 	start := time.Now()
 
 	// Use rate limiter before each request
-	err = bsky.bskyLimiter.Wait(ctx)
+	err = bsky.directoryLimiter.Wait(ctx)
 	if err != nil {
 		span.SetAttributes(attribute.String("rate.limiter.error", err.Error()))
 		return handle, fmt.Errorf("error waiting for rate limiter: %w", err)
@@ -238,9 +238,10 @@ func (bsky *BSky) ResolvePost(ctx context.Context, uri string, workerID int) (*b
 				cacheHits.WithLabelValues("post").Inc()
 				return cacheEntry.Post, nil
 			}
+		} else {
+			// If there was an error scanning the post, add attributes to the span
+			span.SetAttributes(attribute.String("caches.post.scan.error", err.Error()))
 		}
-		// If there was an error scanning the post, add attributes to the span
-		span.SetAttributes(attribute.String("caches.post.scan.error", err.Error()))
 	} else if err != redis.Nil {
 		span.SetAttributes(attribute.String("caches.post.get.error", err.Error()))
 	}
@@ -260,14 +261,13 @@ func (bsky *BSky) ResolvePost(ctx context.Context, uri string, workerID int) (*b
 	worker.ClientMux.RLock()
 	span.AddEvent("ClientRLockAcquired")
 	// Get the post from the API
-	posts, err := FeedGetPostsWithTimeout(ctx, worker.Client, []string{uri}, time.Second*2)
+	posts, err := FeedGetPostsWithTimeout(ctx, worker.Client, []string{uri}, time.Second*5)
 	// Unlock the client
 	span.AddEvent("ReleaseClientRLock")
 	worker.ClientMux.RUnlock()
 	if err != nil {
 		// Check if the error is a timeout
-		var timeoutErr *TimeoutError
-		if errors.As(err, &timeoutErr) {
+		if errors.Is(err, TimeoutError) {
 			span.SetAttributes(attribute.Bool("post.resolve.timeout", true))
 			if cacheEntry != nil {
 				// If the post is cached, increment the timeout count

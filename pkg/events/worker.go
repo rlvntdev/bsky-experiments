@@ -32,10 +32,24 @@ type ImageMeta struct {
 	ThumbnailURL string `json:"thumbnail_url"`
 }
 
-func (bsky *BSky) worker(workerID int) {
-	ctx := context.Background()
+func (bsky *BSky) worker(ctx context.Context, workerID int) {
+	// Create a logger for this worker
+	rawlog, err := zap.NewProduction()
+	if err != nil {
+		fmt.Printf("failed to create logger: %+v\n", err)
+	}
 
-	log := bsky.Workers[workerID].Logger
+	log := rawlog.Sugar().With("worker_id", workerID)
+
+	bsky.Workers[workerID].Logger = log
+
+	defer func() {
+		log.Infof("shutting down worker %d...", workerID)
+		err := log.Sync()
+		if err != nil {
+			fmt.Printf("failed to sync logger on teardown: %+v\n", err.Error())
+		}
+	}()
 
 	log.Infof("starting worker %d\n", workerID)
 
@@ -63,23 +77,36 @@ func (bsky *BSky) worker(workerID int) {
 
 	// Pull from the work queue and process records as they come in
 	for {
-		record := <-bsky.RepoRecordQueue
-		err := bsky.ProcessRepoRecord(
-			record.ctx,
-			record.pst,
-			record.opPath,
-			record.repoName,
-			record.eventTime,
-			workerID,
-		)
-		if err != nil {
-			log.Error("failed to process record: %v\n", err)
+		select {
+		case record, ok := <-bsky.RepoRecordQueue:
+			if !ok {
+				log.Infof("worker %d terminating: RepoRecordQueue has been closed\n", workerID)
+				return
+			}
+
+			err := bsky.ProcessRepoRecord(
+				record.ctx,
+				record.seq,
+				record.pst,
+				record.opPath,
+				record.repoName,
+				record.eventTime,
+				workerID,
+			)
+			if err != nil {
+				log.Errorf("failed to process record: %v\n", err)
+			}
+		case <-ctx.Done():
+			log.Infof("worker %d terminating: context was cancelled\n", workerID)
+			return
 		}
 	}
+
 }
 
 func (bsky *BSky) ProcessRepoRecord(
 	ctx context.Context,
+	seq int64,
 	pst appbsky.FeedPost,
 	opPath string,
 	authorDID string,
@@ -190,7 +217,7 @@ func (bsky *BSky) ProcessRepoRecord(
 		if err != nil {
 			log.Errorf("error fetching post with metadata: %+v\n", err)
 		} else if postMeta == nil {
-			log.Errorf("post with metadata not found")
+			log.Error("post with metadata not found")
 		} else if postMeta.Embed != nil &&
 			postMeta.Embed.EmbedImages_View != nil &&
 			postMeta.Embed.EmbedImages_View.Images != nil &&
@@ -242,19 +269,6 @@ func (bsky *BSky) ProcessRepoRecord(
 			post.ParentRelationship = &parentRelationsip
 		}
 
-		// If sentiment is enabled, get the sentiment for the post
-		if bsky.SentimentAnalysisEnabled {
-			span.AddEvent("HandleRepoCommit:GetPostsSentiment")
-			posts, err := bsky.SentimentAnalysis.GetPostsSentiment(ctx, []search.Post{post})
-			if err != nil {
-				span.SetAttributes(attribute.String("sentiment.error", err.Error()))
-				log.Errorf("error getting sentiment for post %s: %+v\n", postID, err)
-			} else if len(posts) > 0 {
-				post.Sentiment = posts[0].Sentiment
-				post.SentimentConfidence = posts[0].SentimentConfidence
-			}
-		}
-
 		err = bsky.PostRegistry.AddAuthor(ctx, &author)
 		if err != nil {
 			log.Errorf("error writing author to registry: %+v\n", err)
@@ -263,14 +277,6 @@ func (bsky *BSky) ProcessRepoRecord(
 		err = bsky.PostRegistry.AddPost(ctx, &post)
 		if err != nil {
 			log.Errorf("error writing post to registry: %+v\n", err)
-		}
-
-		ti, err := bsky.MeiliClient.Index("posts").UpdateDocuments([]search.Post{post}, "id")
-		if err != nil {
-			log.Errorf("error indexing post: %+v\n", err)
-		}
-		if ti != nil {
-			span.SetAttributes(attribute.Int64("meili.task_uid", ti.TaskUID))
 		}
 
 		// If there are images, write them to the registry
@@ -287,6 +293,7 @@ func (bsky *BSky) ProcessRepoRecord(
 					ThumbnailURL: image.ThumbnailURL,
 					CreatedAt:    t,
 				}
+				span.AddEvent("AddImageToRegistry")
 				err = bsky.PostRegistry.AddImage(ctx, &registryImage)
 				if err != nil {
 					log.Errorf("error writing image to registry: %+v\n", err)
@@ -295,6 +302,7 @@ func (bsky *BSky) ProcessRepoRecord(
 		}
 	}
 
+	span.AddEvent("LogResult")
 	log.Infow("post processed",
 		"post_id", postID,
 		"post_link", postLink,
@@ -309,7 +317,9 @@ func (bsky *BSky) ProcessRepoRecord(
 		"parent_id", parentID,
 		"root_id", rootID,
 		"parent_relationship", parentRelationsip,
-		"created_at", t)
+		"created_at", t,
+		"created_at_fmt", t.UTC().Format(time.RFC3339Nano),
+	)
 
 	// Record the time to process and the count
 	postsProcessedCounter.Inc()

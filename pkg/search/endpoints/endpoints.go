@@ -5,19 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"sync"
 	"time"
 
-	"github.com/ericvolp12/bsky-experiments/pkg/graph"
+	comatproto "github.com/bluesky-social/indigo/api/atproto"
+	"github.com/bluesky-social/indigo/api/bsky"
+	"github.com/bluesky-social/indigo/xrpc"
 	"github.com/ericvolp12/bsky-experiments/pkg/layout"
 	"github.com/ericvolp12/bsky-experiments/pkg/search"
 	"github.com/ericvolp12/bsky-experiments/pkg/search/clusters"
+
 	"github.com/ericvolp12/bsky-experiments/pkg/search/search_queries"
 	"github.com/ericvolp12/bsky-experiments/pkg/usercount"
 	"github.com/gin-gonic/gin"
 	lru "github.com/hashicorp/golang-lru/arc/v2"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -53,7 +56,6 @@ type API struct {
 	PostRegistry *search.PostRegistry
 	UserCount    *usercount.UserCount
 
-	SocialGraph    *graph.Graph
 	ClusterManager *clusters.ClusterManager
 
 	LayoutServiceHost string
@@ -70,22 +72,12 @@ type API struct {
 func NewAPI(
 	postRegistry *search.PostRegistry,
 	userCount *usercount.UserCount,
-	socialGraphPath string,
 	graphJSONUrl string,
 	layoutServiceHost string,
 	threadViewCacheTTL time.Duration,
 	layoutCacheTTL time.Duration,
 	statsCacheTTL time.Duration,
 ) (*API, error) {
-	// Read the graph from the Binary file
-	ctx := context.Background()
-	readerWriter := graph.BinaryGraphReaderWriter{}
-
-	g1, err := readerWriter.ReadGraph(ctx, socialGraphPath)
-	if err != nil {
-		return nil, fmt.Errorf("error reading graph: %w", err)
-	}
-
 	// Hellthread is around 300KB right now so 1000 worst-case threads should be around 300MB
 	threadViewCache, err := lru.NewARC[string, ThreadViewCacheEntry](1000)
 	if err != nil {
@@ -105,7 +97,6 @@ func NewAPI(
 	return &API{
 		PostRegistry:       postRegistry,
 		UserCount:          userCount,
-		SocialGraph:        &g1,
 		ClusterManager:     clusterManager,
 		LayoutServiceHost:  layoutServiceHost,
 		ThreadViewCacheTTL: threadViewCacheTTL,
@@ -145,7 +136,7 @@ func (api *API) GetClusterForHandle(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"cluster_id": cluster.ClusterID, "cluster_name": cluster.ClusterName})
+	c.JSON(http.StatusOK, gin.H{"cluster_id": cluster.ID, "cluster_name": cluster.Name})
 }
 
 func (api *API) GetClusterForDID(c *gin.Context) {
@@ -161,61 +152,11 @@ func (api *API) GetClusterForDID(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"cluster_id": cluster.ClusterID, "cluster_name": cluster.ClusterName})
+	c.JSON(http.StatusOK, gin.H{"cluster_id": cluster.ID, "cluster_name": cluster.Name})
 }
 
 func (api *API) GetClusterList(c *gin.Context) {
 	c.JSON(http.StatusOK, api.ClusterManager.Clusters)
-}
-
-func (api *API) GetSocialDistance(c *gin.Context) {
-	ctx := c.Request.Context()
-	tracer := otel.Tracer("search-api")
-	ctx, span := tracer.Start(ctx, "GetSocialDistance")
-	defer span.End()
-
-	src := c.Query("src")
-	dest := c.Query("dest")
-
-	if src == "" || dest == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "src and dest must be provided"})
-		return
-	}
-
-	// Make sure src and dst DIDs are in the graph
-	if _, ok := api.SocialGraph.Nodes[graph.NodeID(src)]; !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("src with DID '%s' not found", src)})
-		return
-	}
-	if _, ok := api.SocialGraph.Nodes[graph.NodeID(dest)]; !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("dest with DID '%s' not found", dest)})
-		return
-	}
-
-	distance, path, weights := api.SocialGraph.FindSocialDistance(graph.NodeID(src), graph.NodeID(dest))
-
-	// Return the distance, path, and weights with Handles and DIDs
-
-	// Get the handles for the nodes in the path
-	handles := make([]string, len(path))
-	for i, nodeID := range path {
-		handles[i] = api.SocialGraph.Nodes[nodeID].Handle
-	}
-
-	// Make sure weights and distnaces aren't infinite before returning them
-	for i, weight := range weights {
-		if math.IsInf(weight, 0) {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("infinite weight for edge %s -> %s", path[i-1], path[i])})
-			return
-		}
-	}
-
-	if math.IsInf(distance, 0) {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("infinite distance between %s and %s", src, dest)})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"distance": distance, "did_path": path, "handle_path": handles, "weights": weights})
 }
 
 func (api *API) GetAuthorStats(c *gin.Context) {
@@ -352,6 +293,173 @@ func (api *API) LayoutThread(ctx context.Context, rootPostID string, threadView 
 	})
 
 	return threadViewLayout, nil
+}
+
+type GraphOptRequest struct {
+	Username    string `json:"username"`
+	AppPassword string `json:"appPassword"`
+}
+
+func (api *API) GraphOptOut(c *gin.Context) {
+	ctx := c.Request.Context()
+	tracer := otel.Tracer("search-api")
+	ctx, span := tracer.Start(ctx, "GraphOptOut")
+	defer span.End()
+
+	// get Username and appPassword from Post Body
+	var optOutRequest GraphOptRequest
+	if err := c.ShouldBindJSON(&optOutRequest); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Create an instrumented transport for OTEL Tracing of HTTP Requests
+	instrumentedTransport := otelhttp.NewTransport(&http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	})
+
+	// Create the XRPC Client
+	client := xrpc.Client{
+		Client: &http.Client{
+			Transport: instrumentedTransport,
+		},
+		Host: "https://bsky.social",
+	}
+
+	// Create a new XRPC Client authenticated as the user
+	ses, err := comatproto.ServerCreateSession(ctx, &client, &comatproto.ServerCreateSession_Input{
+		Identifier: optOutRequest.Username,
+		Password:   optOutRequest.AppPassword,
+	})
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Errorf("Error creating authenticated ATProto session: %w\nYour username and/or AppPassword may be incorrect", err).Error()})
+		return
+	}
+
+	client.Auth = &xrpc.AuthInfo{
+		Handle:     ses.Handle,
+		Did:        ses.Did,
+		RefreshJwt: ses.RefreshJwt,
+		AccessJwt:  ses.AccessJwt,
+	}
+
+	// Try to Get the user's profile to confirm that the user is authenticated
+	profile, err := bsky.ActorGetProfile(ctx, &client, ses.Handle)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Errorf("Error getting user profile while confirming identity: %w\n"+
+			"There may have been a problem communicating with the BSky API, "+
+			"as we can't confirm your identity without that info, we are unable to process your opt-out right now.", err).Error()})
+		return
+	}
+
+	if profile == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to get your profile from the BSky API when confirming your identity, we can't process your opt-out right now."})
+		return
+	}
+
+	// Create an OptOut record for the user
+	err = api.PostRegistry.UpdateAuthorOptOut(ctx, ses.Did, true)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Errorf("Error while updating author opt out record in the Atlas Database: %w\n"+
+			"Please feel free to @mention jaz.bsky.social on the Skyline for support for this error, since it's likely an issue with something Jaz can fix.", err).Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "You have successfully opted out of the Atlas"})
+}
+
+func (api *API) GraphOptIn(c *gin.Context) {
+	ctx := c.Request.Context()
+	tracer := otel.Tracer("search-api")
+	ctx, span := tracer.Start(ctx, "GraphOptIn")
+	defer span.End()
+
+	// get Username and appPassword from Post Body
+	var optInRequest GraphOptRequest
+	if err := c.ShouldBindJSON(&optInRequest); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Create an instrumented transport for OTEL Tracing of HTTP Requests
+	instrumentedTransport := otelhttp.NewTransport(&http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	})
+
+	// Create the XRPC Client
+	client := xrpc.Client{
+		Client: &http.Client{
+			Transport: instrumentedTransport,
+		},
+		Host: "https://bsky.social",
+	}
+
+	// Create a new XRPC Client authenticated as the user
+	ses, err := comatproto.ServerCreateSession(ctx, &client, &comatproto.ServerCreateSession_Input{
+		Identifier: optInRequest.Username,
+		Password:   optInRequest.AppPassword,
+	})
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Errorf("Error creating authenticated ATProto session: %w\nYour username and/or AppPassword may be incorrect", err).Error()})
+		return
+	}
+
+	client.Auth = &xrpc.AuthInfo{
+		Handle:     ses.Handle,
+		Did:        ses.Did,
+		RefreshJwt: ses.RefreshJwt,
+		AccessJwt:  ses.AccessJwt,
+	}
+
+	// Try to Get the user's profile to confirm that the user is authenticated
+	profile, err := bsky.ActorGetProfile(ctx, &client, ses.Handle)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Errorf("Error getting user profile while confirming identity: %w\n"+
+			"There may have been a problem communicating with the BSky API, "+
+			"as we can't confirm your identity without that info, we are unable to process your opt-in right now.", err).Error()})
+		return
+	}
+
+	if profile == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to get your profile from the BSky API when confirming your identity, we can't process your opt-in right now."})
+		return
+	}
+
+	// Set the user's opt-out record to false
+	err = api.PostRegistry.UpdateAuthorOptOut(ctx, ses.Did, false)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Errorf("Error while updating author opt out record in the Atlas Database: %w\n"+
+			"Please feel free to @mention jaz.bsky.social on the Skyline for support for this error, since it's likely an issue with something Jaz can fix.", err).Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "You have successfully opted back into the Atlas"})
+}
+
+func (api *API) GetOptedOutAuthors(c *gin.Context) {
+	ctx := c.Request.Context()
+	tracer := otel.Tracer("search-api")
+	ctx, span := tracer.Start(ctx, "GetOptedOutAuthors")
+	defer span.End()
+
+	authors, err := api.PostRegistry.GetOptedOutAuthors(ctx)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Errorf("Error getting opted out authors from the Atlas Database: %w\n"+
+			"Please feel free to @mention jaz.bsky.social on the Skyline for support for this error, since it's likely an issue with something Jaz can fix.", err).Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"authors": authors})
 }
 
 func (api *API) ProcessThreadRequest(c *gin.Context) {

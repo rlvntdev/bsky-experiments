@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "net/http/pprof"
@@ -16,17 +18,11 @@ import (
 	"github.com/bluesky-social/indigo/events"
 	intEvents "github.com/ericvolp12/bsky-experiments/pkg/events"
 	"github.com/ericvolp12/bsky-experiments/pkg/persistedgraph"
+	"github.com/ericvolp12/bsky-experiments/pkg/tracing"
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
-	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
@@ -40,14 +36,32 @@ var tracer trace.Tracer
 
 func main() {
 	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Trap SIGINT to trigger a shutdown.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		select {
+		case <-signals:
+			cancel()
+			fmt.Println("shutting down on signal")
+		case <-ctx.Done():
+			fmt.Println("shutting down on context done")
+		}
+	}()
+
 	rawlog, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("failed to create logger: %+v\n", err)
 	}
 	defer func() {
+		log.Printf("main function teardown\n")
 		err := rawlog.Sync()
 		if err != nil {
-			fmt.Printf("failed to sync logger on teardown: %+v", err.Error())
+			log.Printf("failed to sync logger on teardown: %+v", err.Error())
 		}
 	}()
 
@@ -58,7 +72,7 @@ func main() {
 	// Registers a tracer Provider globally if the exporter endpoint is set
 	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
 		log.Info("initializing tracer...")
-		shutdown, err := installExportPipeline(ctx)
+		shutdown, err := tracing.InstallExportPipeline(ctx, "BSkyGraphBuilder", 0.2)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -74,7 +88,7 @@ func main() {
 
 	includeLinks := os.Getenv("INCLUDE_LINKS") == "true"
 
-	workerCount := 5
+	workerCount := 20
 
 	postRegistryEnabled := false
 	dbConnectionString := os.Getenv("REGISTRY_DB_CONNECTION_STRING")
@@ -82,20 +96,9 @@ func main() {
 		postRegistryEnabled = true
 	}
 
-	sentimentAnalysisEnabled := false
-	sentimentServiceHost := os.Getenv("SENTIMENT_SERVICE_HOST")
-	if sentimentServiceHost != "" {
-		sentimentAnalysisEnabled = true
-	}
-
 	redisAddress := os.Getenv("REDIS_ADDRESS")
 	if redisAddress == "" {
 		redisAddress = "localhost:6379"
-	}
-
-	meiliAddress := os.Getenv("MEILI_ADDRESS")
-	if meiliAddress == "" {
-		meiliAddress = "http://localhost:7700"
 	}
 
 	redisClient := redis.NewClient(&redis.Options{
@@ -128,9 +131,8 @@ func main() {
 	log.Info("initializing BSky Event Handler...")
 	bsky, err := intEvents.NewBSky(
 		ctx,
-		log,
-		includeLinks, postRegistryEnabled, sentimentAnalysisEnabled,
-		dbConnectionString, sentimentServiceHost, meiliAddress,
+		includeLinks, postRegistryEnabled,
+		dbConnectionString,
 		redisGraph,
 		redisClient,
 		workerCount,
@@ -139,20 +141,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Try to read the seq number from Redis
-	cursor := redisGraph.Cursor
-	if cursor != "" {
-		log.Infof("found cursor in redis: %s", cursor)
-		u.RawQuery = fmt.Sprintf("cursor=%s", cursor)
-	}
-
 	quit := make(chan struct{})
 
 	wg := &sync.WaitGroup{}
 
 	// Server for pprof and prometheus via promhttp
 	go func() {
-		log = log.With("source", "pprof_server")
+		rawlog, err := zap.NewProduction()
+		if err != nil {
+			log.Fatalf("failed to create logger: %+v\n", err)
+		}
+		log := rawlog.Sugar().With("source", "pprof_server")
 		log.Info("starting pprof and prometheus server...")
 		// Create a handler to write out the plaintext graph
 		http.HandleFunc("/graph", func(w http.ResponseWriter, r *http.Request) {
@@ -197,44 +196,6 @@ func main() {
 	log.Info("routines finished, exiting...")
 }
 
-func installExportPipeline(ctx context.Context) (func(context.Context) error, error) {
-	client := otlptracehttp.NewClient()
-	exporter, err := otlptrace.New(ctx, client)
-	if err != nil {
-		return nil, fmt.Errorf("creating OTLP trace exporter: %w", err)
-	}
-
-	tracerProvider := newTraceProvider(exporter)
-	otel.SetTracerProvider(tracerProvider)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
-
-	return tracerProvider.Shutdown, nil
-}
-
-func newTraceProvider(exp sdktrace.SpanExporter) *sdktrace.TracerProvider {
-	// Ensure default SDK resources and the required service name are set.
-	r, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName("BSkyGraphBuilder"),
-		),
-	)
-
-	if err != nil {
-		panic(err)
-	}
-
-	// initialize the traceIDRatioBasedSampler
-	traceIDRatioBasedSampler := sdktrace.TraceIDRatioBased(1)
-
-	return sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(traceIDRatioBasedSampler),
-		sdktrace.WithBatcher(exp),
-		sdktrace.WithResource(r),
-	)
-}
-
 func getNextBackoff(currentBackoff time.Duration) time.Duration {
 	if currentBackoff == 0 {
 		return time.Second
@@ -251,8 +212,43 @@ func handleRepoStreamWithRetry(
 	callbacks *intEvents.RepoStreamCtxCallbacks,
 ) error {
 	var backoff time.Duration
+	// Create a new context with a cancel function
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Start a timer to check for graph updates
+	updateCheckDuration := 1 * time.Minute
+	updateCheckTimer := time.NewTicker(updateCheckDuration)
+	defer updateCheckTimer.Stop()
+
+	// Run a goroutine to handle the graph update check
+	go func() {
+		lastSeq := int64(0)
+		for {
+			select {
+			case <-updateCheckTimer.C:
+				bsky.SeqMux.RLock()
+				if lastSeq >= bsky.LastSeq {
+					fmt.Printf("lastSeq: %d, bsky.LastSeq: %d | progress hasn't been made in %v, exiting...\n", lastSeq, bsky.LastSeq, updateCheckDuration)
+					bsky.SeqMux.RUnlock()
+					cancel()
+				}
+				lastSeq = bsky.LastSeq
+				bsky.SeqMux.RUnlock()
+			case <-streamCtx.Done():
+				return
+			}
+		}
+	}()
 
 	for {
+		// Try to read the seq number from Redis
+		cursor := bsky.PersistedGraph.GetCursor(ctx)
+		if cursor != "" {
+			log.Infof("found cursor in redis: %s", cursor)
+			u.RawQuery = fmt.Sprintf("cursor=%s", cursor)
+		}
+
 		log.Info("connecting to BSky WebSocket...")
 		c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 		if err != nil {
@@ -261,33 +257,11 @@ func handleRepoStreamWithRetry(
 		}
 		defer c.Close()
 
-		// Create a new context with a cancel function
-		streamCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
-		// Start a timer to check for graph updates
-		updateCheckDuration := 30 * time.Second
-		updateCheckTimer := time.NewTicker(updateCheckDuration)
-		defer updateCheckTimer.Stop()
-
-		// Run a goroutine to handle the graph update check
 		go func() {
-			for {
-				select {
-				case <-updateCheckTimer.C:
-					bsky.PersistedGraph.CursorMux.RLock()
-					if bsky.PersistedGraph.LastUpdated.Add(updateCheckDuration).Before(time.Now()) {
-						log.Infof("The graph hasn't been updated in the past %v seconds, exiting the graph builder (docker should restart it and get us in a good state)", updateCheckDuration)
-						bsky.PersistedGraph.CursorMux.RUnlock()
-						os.Exit(1)
-						cancel()
-						c.Close()
-						return
-					}
-					bsky.PersistedGraph.CursorMux.RUnlock()
-				case <-streamCtx.Done():
-					return
-				}
+			select {
+			case <-streamCtx.Done():
+				log.Info("closing websocket...")
+				c.Close()
 			}
 		}()
 
@@ -304,6 +278,7 @@ func handleRepoStreamWithRetry(
 		})
 
 		err = events.HandleRepoStream(streamCtx, c, pool)
+		log.Info("HandleRepoStream returned unexpectedly: %w...", err)
 		if err != nil {
 			log.Infof("Error in event handler routine: %v", err)
 			backoff = getNextBackoff(backoff)
@@ -314,11 +289,11 @@ func handleRepoStreamWithRetry(
 			select {
 			case <-time.After(backoff):
 				log.Infof("Reconnecting after %v...", backoff)
+				continue
 			case <-ctx.Done():
 				return ctx.Err()
 			}
-		} else {
-			return nil
 		}
+		return nil
 	}
 }
